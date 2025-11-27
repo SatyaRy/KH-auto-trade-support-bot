@@ -36,6 +36,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly supabaseBucket: string | null;
   private readonly webhookUrl: string | null;
   private readonly webhookSecret: string | null;
+  private readonly useLongPolling: boolean;
 
   constructor(
     private readonly configService: ConfigService,
@@ -99,6 +100,15 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     );
 
     this.webhookUrl = this.resolveWithAlias('WEBHOOK_URL', 'TELEGRAM_WEBHOOK_URL');
+    const pollingPreference =
+      this.configService.get<string>('TELEGRAM_USE_POLLING')?.toLowerCase() ?? null;
+    if (!this.webhookUrl && pollingPreference === 'false') {
+      this.logger.warn(
+        'WEBHOOK_URL missing but TELEGRAM_USE_POLLING=false; enabling polling so the bot can run locally.',
+      );
+    }
+
+    this.useLongPolling = pollingPreference === 'true' || !this.webhookUrl;
     this.webhookSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET') ?? null;
   }
 
@@ -115,9 +125,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       throw new Error('BOT_TOKEN is not set.');
     }
 
-    this.bot = new Telegraf(token, { handlerTimeout: 10_000 });
+    this.bot = new Telegraf(token, { handlerTimeout: 60_000 });
 
     this.registerHandlers();
+
+    if (this.useLongPolling) {
+      await this.startLongPolling();
+      return;
+    }
 
     await this.configureWebhook();
     this.logger.log('Telegram bot is running with webhooks');
@@ -125,6 +140,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   async stop(): Promise<void> {
     if (this.bot) {
+      if (this.useLongPolling) {
+        this.bot.stop('App shutdown');
+        this.logger.log('Stopped Telegram bot polling');
+        return;
+      }
+
       await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
       this.logger.log('Removed Telegram bot webhook');
     }
@@ -150,6 +171,17 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.logger.log(`Webhook configured at ${this.webhookUrl}`);
+  }
+
+  private async startLongPolling(): Promise<void> {
+    const bot = this.bot;
+    if (!bot) {
+      return;
+    }
+
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    await bot.launch({ dropPendingUpdates: true });
+    this.logger.log('Telegram bot is running with long polling (no webhook configured)');
   }
 
   private registerHandlers(): void {
@@ -178,12 +210,18 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       await ctx.replyWithHTML(`Success: <b>${option.label}</b>\n\n${option.caption}`);
 
       const videoUrl = await this.getVideoUrl(option);
-      if (videoUrl) {
-        await ctx.replyWithVideo({ url: videoUrl }, { caption: option.caption });
-      } else {
+      if (!videoUrl) {
         await ctx.reply(
           'Video will be delivered soon. (Supabase storage not configured or file not found.)',
         );
+        return;
+      }
+
+      try {
+        await ctx.replyWithVideo({ url: videoUrl }, { caption: option.caption });
+      } catch (error) {
+        this.logger.error(`Failed to send video for ${option.storagePath}: ${String(error)}`);
+        await ctx.reply('Sorry, failed to send the video. Please try again in a moment.');
       }
     });
   }
@@ -230,9 +268,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     if (url) {
       const expiresAt = now + expiresInSeconds * 1000;
       this.signedUrlCache.set(cacheKey, { url, expiresAt });
+      return url;
     }
 
-    return url;
+    const publicUrl = this.supabaseService.getPublicUrl(bucket, option.storagePath);
+    if (publicUrl) {
+      this.logger.warn(`Using public Supabase URL for ${option.storagePath} (signed URL not available).`);
+      return publicUrl;
+    }
+
+    return null;
   }
 
   private isVideoOptionKey(value: string): value is VideoOptionKey {

@@ -41,4 +41,13 @@ export class SupabaseService {
 
     return data?.signedUrl ?? null;
   }
+
+  getPublicUrl(bucket: string, path: string): string | null {
+    if (!this.client) {
+      return null;
+    }
+
+    const { data } = this.client.storage.from(bucket).getPublicUrl(path);
+    return data?.publicUrl ?? null;
+  }
 }
