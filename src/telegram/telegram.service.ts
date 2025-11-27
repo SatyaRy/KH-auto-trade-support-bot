@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import TelegramBot, { InlineKeyboardButton, InlineKeyboardMarkup } from 'node-telegram-bot-api';
+import { Markup, Telegraf } from 'telegraf';
+import { Update } from 'telegraf/types';
 
 import { SupabaseService } from '../supabase/supabase.service';
 
@@ -23,17 +24,17 @@ type VideoOption = {
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
-  private bot: TelegramBot | null = null;
+  private bot: Telegraf | null = null;
   private readonly logger = new Logger(TelegramService.name);
 
   private readonly videoOptions: Record<VideoOptionKey, VideoOption>;
   private readonly introMessage =
     'Hi! Choose a support topic below and I will send you the matching guide.\n\nYou can type /help any time to see this menu again.';
-  private readonly menuMarkup: InlineKeyboardMarkup;
+  private readonly menuMarkup: ReturnType<typeof Markup.inlineKeyboard>;
   private readonly signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
 
   private readonly supabaseBucket: string | null;
-  private readonly webhookBaseUrl: string | null;
+  private readonly webhookUrl: string | null;
   private readonly webhookSecret: string | null;
 
   constructor(
@@ -91,8 +92,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       },
     };
 
-    this.menuMarkup = { inline_keyboard: this.buildKeyboard() };
-    this.webhookBaseUrl = this.configService.get<string>('TELEGRAM_WEBHOOK_URL') ?? null;
+    this.menuMarkup = Markup.inlineKeyboard(
+      Object.entries(this.videoOptions).map(([key, option]) => [
+        Markup.button.callback(option.label, key),
+      ]),
+    );
+
+    this.webhookUrl =
+      this.configService.get<string>('WEBHOOK_URL') ??
+      this.configService.get<string>('TELEGRAM_WEBHOOK_URL') ??
+      null;
     this.webhookSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET') ?? null;
   }
 
@@ -101,79 +110,49 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const token = this.configService.get<string>('TELEGRAM_BOT_TOKEN');
+    const token =
+      this.configService.get<string>('BOT_TOKEN') ??
+      this.configService.get<string>('TELEGRAM_BOT_TOKEN');
     if (!token) {
       this.logger.error(
-        'TELEGRAM_BOT_TOKEN is missing. Set it in your environment or .env file.',
+        'BOT_TOKEN is missing. Set it in your environment or .env file.',
       );
-      throw new Error('TELEGRAM_BOT_TOKEN is not set.');
+      throw new Error('BOT_TOKEN is not set.');
     }
 
-    const shouldUseWebhook = Boolean(this.webhookBaseUrl);
-
-    if (shouldUseWebhook) {
-      this.bot = new TelegramBot(token, {
-        polling: false,
-        onlyFirstMatch: true,
-      });
-      await this.configureWebhook();
-    } else {
-      this.bot = new TelegramBot(token, {
-        polling: {
-          interval: 150,
-          params: {
-            timeout: 10,
-            allowed_updates: ['message', 'callback_query'],
-          },
-        },
-        onlyFirstMatch: true,
-      });
-
-      this.bot.on('polling_error', (error) =>
-        this.logger.error(`Telegram polling error: ${error.message}`),
-      );
-    }
+    this.bot = new Telegraf(token, { handlerTimeout: 10_000 });
 
     this.registerHandlers();
 
-    if (shouldUseWebhook) {
-      this.logger.log('Telegram bot is running with webhooks');
-    } else {
-      this.logger.log('Telegram bot is running with long polling');
-    }
+    await this.configureWebhook();
+    this.logger.log('Telegram bot is running with webhooks');
   }
 
   async stop(): Promise<void> {
     if (this.bot) {
-      const hasWebhook = Boolean(this.webhookBaseUrl);
-
-      if (hasWebhook) {
-        // drop_pending_updates option exists in Telegram API but is missing from types
-        await (this.bot as any).deleteWebHook({ drop_pending_updates: true });
-        this.logger.log('Removed Telegram bot webhook');
-      } else {
-        await this.bot.stopPolling();
-        this.logger.log('Stopped Telegram bot polling');
-      }
+      await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
+      this.logger.log('Removed Telegram bot webhook');
     }
   }
 
   private async configureWebhook(): Promise<void> {
     const bot = this.bot;
-    if (!bot || !this.webhookBaseUrl) {
+    if (!bot) {
       return;
     }
 
-    const normalizedBase = this.webhookBaseUrl.replace(/\/$/, '');
-    const webhookUrl = `${normalizedBase}/telegram/webhook`;
+    if (!this.webhookUrl) {
+      this.logger.error('WEBHOOK_URL/TELEGRAM_WEBHOOK_URL is missing; cannot start webhook bot');
+      return;
+    }
 
-    await (bot as any).deleteWebHook({ drop_pending_updates: true });
-    await bot.setWebHook(webhookUrl, {
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    await bot.telegram.setWebhook(this.webhookUrl, {
       secret_token: this.webhookSecret ?? undefined,
       allowed_updates: ['message', 'callback_query'],
     });
 
-    this.logger.log(`Webhook configured at ${webhookUrl}`);
+    this.logger.log(`Webhook configured at ${this.webhookUrl}`);
   }
 
   private registerHandlers(): void {
@@ -182,53 +161,34 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    bot.onText(/\/(start|help)/, (msg) => {
-      const chatId = msg.chat.id;
-      bot.sendMessage(chatId, this.introMessage, {
-        reply_markup: this.menuMarkup,
-      });
-    });
+    bot.start((ctx) => ctx.reply(this.introMessage, this.menuMarkup));
+    bot.help((ctx) => ctx.reply(this.introMessage, this.menuMarkup));
 
-    bot.on('callback_query', async (query) => {
-      const data = query.data as VideoOptionKey | undefined;
-      const option = data ? this.videoOptions[data] : null;
+    bot.on('callback_query', async (ctx) => {
+      const callbackQuery = ctx.callbackQuery;
+      const data =
+        callbackQuery && 'data' in callbackQuery
+          ? (callbackQuery.data as string | undefined)
+          : undefined;
 
-      if (!option || !query.message) {
-        if (query.id) {
-          await bot.answerCallbackQuery(query.id, {
-            text: "Sorry, I don't recognize that option.",
-            show_alert: false,
-          });
-        }
+      const option = data && this.isVideoOptionKey(data) ? this.videoOptions[data] : null;
+      if (!option) {
+        await ctx.answerCbQuery('Unknown option');
         return;
       }
 
-      const chatId = query.message.chat.id;
-      await bot.answerCallbackQuery(query.id, { text: 'Success ✅' });
-      await bot.sendMessage(
-        chatId,
-        `Success: <b>${option.label}</b>\n\n${option.caption}`,
-        { parse_mode: 'HTML' },
-      );
+      await ctx.answerCbQuery('Success ✅');
+      await ctx.replyWithHTML(`Success: <b>${option.label}</b>\n\n${option.caption}`);
 
       const videoUrl = await this.getVideoUrl(option);
       if (videoUrl) {
-        await bot.sendVideo(chatId, videoUrl, {
-          caption: option.caption,
-        });
+        await ctx.replyWithVideo({ url: videoUrl }, { caption: option.caption });
       } else {
-        await bot.sendMessage(
-          chatId,
+        await ctx.reply(
           'Video will be delivered soon. (Supabase storage not configured or file not found.)',
         );
       }
     });
-  }
-
-  private buildKeyboard(): InlineKeyboardButton[][] {
-    return Object.entries(this.videoOptions).map(([key, option]) => [
-      { text: option.label, callback_data: key },
-    ]);
   }
 
   private async getVideoUrl(option: VideoOption): Promise<string | null> {
@@ -263,6 +223,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     return url;
   }
 
+  private isVideoOptionKey(value: string): value is VideoOptionKey {
+    return value in this.videoOptions;
+  }
+
   getOptions(): Array<VideoOption & { key: VideoOptionKey }> {
     return Object.entries(this.videoOptions).map(([key, option]) => ({
       key: key as VideoOptionKey,
@@ -275,7 +239,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   async handleWebhookUpdate(
-    update: TelegramBot.Update,
+    update: Update,
     secretFromHeader?: string,
   ): Promise<{ ok: boolean }> {
     if (this.webhookSecret && this.webhookSecret !== secretFromHeader) {
@@ -288,7 +252,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return { ok: false };
     }
 
-    this.bot.processUpdate(update);
+    await this.bot.handleUpdate(update);
     return { ok: true };
   }
 }

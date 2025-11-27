@@ -15,9 +15,9 @@
     "@nestjs/platform-express": "^10.3.2",
     "@nestjs/config": "^3.2.2",
     "@supabase/supabase-js": "^2.45.4",
-    "node-telegram-bot-api": "^0.66.0",
     "reflect-metadata": "^0.2.1",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "telegraf": "^4.15.3"
   },
   "devDependencies": {
     "@types/node": "^20.11.24",
