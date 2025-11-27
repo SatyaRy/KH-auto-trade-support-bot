@@ -41,11 +41,6 @@ The HTTP server exposes simple endpoints (e.g., `/telegram/options`, `/telegram/
 - Stop: `docker compose down`
 - Uses `docker-compose.yml` with `env_file: .env` and exposes port `3000` by default; override with `PORT` in `.env` if needed.
 
-## Deploying with webhooks (Vercel-friendly)
-
-- The bot always uses webhooks (no long polling). Telegram should call `POST /telegram/webhook` on your deployed Nest server.
-- Set `WEBHOOK_URL` to the full path, e.g., `https://your-app.vercel.app/telegram/webhook`. (`TELEGRAM_WEBHOOK_URL` still works as a legacy alias.)
-- Set `TELEGRAM_WEBHOOK_SECRET` and use the same value when Telegram sends requests; the bot rejects webhook calls with the wrong secret header.
 
 ## Customizing support videos
 
