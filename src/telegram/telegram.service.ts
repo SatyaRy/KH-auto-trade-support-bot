@@ -33,6 +33,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
 
   private readonly supabaseBucket: string | null;
+  private readonly webhookBaseUrl: string | null;
+  private readonly webhookSecret: string | null;
 
   constructor(
     private readonly configService: ConfigService,
@@ -90,6 +92,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     };
 
     this.menuMarkup = { inline_keyboard: this.buildKeyboard() };
+    this.webhookBaseUrl = this.configService.get<string>('TELEGRAM_WEBHOOK_URL') ?? null;
+    this.webhookSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET') ?? null;
   }
 
   async onModuleInit(): Promise<void> {
@@ -105,31 +109,71 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       throw new Error('TELEGRAM_BOT_TOKEN is not set.');
     }
 
-    this.bot = new TelegramBot(token, {
-      polling: {
-        interval: 150,
-        params: {
-          timeout: 10,
-          allowed_updates: ['message', 'callback_query'],
-        },
-      },
-      onlyFirstMatch: true,
-    });
+    const shouldUseWebhook = Boolean(this.webhookBaseUrl);
 
-    this.bot.on('polling_error', (error) =>
-      this.logger.error(`Telegram polling error: ${error.message}`),
-    );
+    if (shouldUseWebhook) {
+      this.bot = new TelegramBot(token, {
+        polling: false,
+        onlyFirstMatch: true,
+      });
+      await this.configureWebhook();
+    } else {
+      this.bot = new TelegramBot(token, {
+        polling: {
+          interval: 150,
+          params: {
+            timeout: 10,
+            allowed_updates: ['message', 'callback_query'],
+          },
+        },
+        onlyFirstMatch: true,
+      });
+
+      this.bot.on('polling_error', (error) =>
+        this.logger.error(`Telegram polling error: ${error.message}`),
+      );
+    }
 
     this.registerHandlers();
 
-    this.logger.log('Telegram bot is running with long polling');
+    if (shouldUseWebhook) {
+      this.logger.log('Telegram bot is running with webhooks');
+    } else {
+      this.logger.log('Telegram bot is running with long polling');
+    }
   }
 
   async stop(): Promise<void> {
     if (this.bot) {
-      await this.bot.stopPolling();
-      this.logger.log('Stopped Telegram bot polling');
+      const hasWebhook = Boolean(this.webhookBaseUrl);
+
+      if (hasWebhook) {
+        // drop_pending_updates option exists in Telegram API but is missing from types
+        await (this.bot as any).deleteWebHook({ drop_pending_updates: true });
+        this.logger.log('Removed Telegram bot webhook');
+      } else {
+        await this.bot.stopPolling();
+        this.logger.log('Stopped Telegram bot polling');
+      }
     }
+  }
+
+  private async configureWebhook(): Promise<void> {
+    const bot = this.bot;
+    if (!bot || !this.webhookBaseUrl) {
+      return;
+    }
+
+    const normalizedBase = this.webhookBaseUrl.replace(/\/$/, '');
+    const webhookUrl = `${normalizedBase}/telegram/webhook`;
+
+    await (bot as any).deleteWebHook({ drop_pending_updates: true });
+    await bot.setWebHook(webhookUrl, {
+      secret_token: this.webhookSecret ?? undefined,
+      allowed_updates: ['message', 'callback_query'],
+    });
+
+    this.logger.log(`Webhook configured at ${webhookUrl}`);
   }
 
   private registerHandlers(): void {
@@ -228,5 +272,23 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     await this.stop();
+  }
+
+  async handleWebhookUpdate(
+    update: TelegramBot.Update,
+    secretFromHeader?: string,
+  ): Promise<{ ok: boolean }> {
+    if (this.webhookSecret && this.webhookSecret !== secretFromHeader) {
+      this.logger.warn('Rejected Telegram webhook: invalid secret token');
+      return { ok: false };
+    }
+
+    if (!this.bot) {
+      this.logger.error('Webhook received before bot was initialized');
+      return { ok: false };
+    }
+
+    this.bot.processUpdate(update);
+    return { ok: true };
   }
 }

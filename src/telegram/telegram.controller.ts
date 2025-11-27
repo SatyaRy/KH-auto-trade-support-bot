@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Post } from '@nestjs/common';
 
 import { TelegramService } from './telegram.service';
 
@@ -14,5 +14,13 @@ export class TelegramController {
   @Get('health')
   health() {
     return { status: 'ok', source: 'telegram-bot' };
+  }
+
+  @Post('webhook')
+  handleWebhook(
+    @Body() update: any,
+    @Headers('x-telegram-bot-api-secret-token') secretToken?: string,
+  ) {
+    return this.telegramService.handleWebhookUpdate(update, secretToken);
   }
 }

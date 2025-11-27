@@ -15,6 +15,8 @@ TELEGRAM_BOT_TOKEN=your_botfather_token_here
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_BUCKET=videos
+TELEGRAM_WEBHOOK_URL=https://your-vercel-deployment.vercel.app   # optional: enables webhook mode
+TELEGRAM_WEBHOOK_SECRET=super_secret_token                       # optional: validates Telegram webhook header
 ```
 3) Run the bot (HTTP server + Telegram worker)
 ```
@@ -23,6 +25,12 @@ pnpm run start        # uses ts-node
 pnpm run build && node dist/main.js
 ```
 The HTTP server exposes simple endpoints (e.g., `/telegram/options`, `/telegram/health`) while the Telegram worker runs via `OnModuleInit`.
+
+## Deploying with webhooks (Vercel-friendly)
+
+- If `TELEGRAM_WEBHOOK_URL` is set, the bot runs in webhook mode (good for serverless). Telegram will call `POST /telegram/webhook`.
+- Set `TELEGRAM_WEBHOOK_SECRET` and configure the same value in your Telegram webhook to reject spoofed requests.
+- Without `TELEGRAM_WEBHOOK_URL`, the bot falls back to long polling (good for local or long-lived servers).
 
 ## Customizing support videos
 
