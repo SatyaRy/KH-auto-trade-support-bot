@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import TelegramBot, { InlineKeyboardButton } from 'node-telegram-bot-api';
+import TelegramBot, { InlineKeyboardButton, InlineKeyboardMarkup } from 'node-telegram-bot-api';
 
 import { SupabaseService } from '../supabase/supabase.service';
 
@@ -27,6 +27,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramService.name);
 
   private readonly videoOptions: Record<VideoOptionKey, VideoOption>;
+  private readonly introMessage =
+    'Hi! Choose a support topic below and I will send you the matching guide.\n\nYou can type /help any time to see this menu again.';
+  private readonly menuMarkup: InlineKeyboardMarkup;
+  private readonly signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
 
   private readonly supabaseBucket: string | null;
 
@@ -84,6 +88,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         storagePath: 'videos/copy-bot-settings-balances.mp4',
       },
     };
+
+    this.menuMarkup = { inline_keyboard: this.buildKeyboard() };
   }
 
   async onModuleInit(): Promise<void> {
@@ -99,7 +105,21 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       throw new Error('TELEGRAM_BOT_TOKEN is not set.');
     }
 
-    this.bot = new TelegramBot(token, { polling: true });
+    this.bot = new TelegramBot(token, {
+      polling: {
+        interval: 150,
+        params: {
+          timeout: 10,
+          allowed_updates: ['message', 'callback_query'],
+        },
+      },
+      onlyFirstMatch: true,
+    });
+
+    this.bot.on('polling_error', (error) =>
+      this.logger.error(`Telegram polling error: ${error.message}`),
+    );
+
     this.registerHandlers();
 
     this.logger.log('Telegram bot is running with long polling');
@@ -120,10 +140,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     bot.onText(/\/(start|help)/, (msg) => {
       const chatId = msg.chat.id;
-      const intro =
-        'Hi! Choose a support topic below and I will send you the matching guide.\n\nYou can type /help any time to see this menu again.';
-      bot.sendMessage(chatId, intro, {
-        reply_markup: { inline_keyboard: this.buildKeyboard() },
+      bot.sendMessage(chatId, this.introMessage, {
+        reply_markup: this.menuMarkup,
       });
     });
 
@@ -178,7 +196,27 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
 
-    return this.supabaseService.getSignedUrl(bucket, option.storagePath);
+    const cacheKey = `${bucket}:${option.storagePath}`;
+    const cached = this.signedUrlCache.get(cacheKey);
+    const now = Date.now();
+
+    if (cached && cached.expiresAt > now + 15_000) {
+      return cached.url;
+    }
+
+    const expiresInSeconds = 3600;
+    const url = await this.supabaseService.getSignedUrl(
+      bucket,
+      option.storagePath,
+      expiresInSeconds,
+    );
+
+    if (url) {
+      const expiresAt = now + expiresInSeconds * 1000;
+      this.signedUrlCache.set(cacheKey, { url, expiresAt });
+    }
+
+    return url;
   }
 
   getOptions(): Array<VideoOption & { key: VideoOptionKey }> {
