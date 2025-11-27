@@ -98,10 +98,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       ]),
     );
 
-    this.webhookUrl =
-      this.configService.get<string>('WEBHOOK_URL') ??
-      this.configService.get<string>('TELEGRAM_WEBHOOK_URL') ??
-      null;
+    this.webhookUrl = this.resolveWithAlias('WEBHOOK_URL', 'TELEGRAM_WEBHOOK_URL');
     this.webhookSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET') ?? null;
   }
 
@@ -110,12 +107,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const token =
-      this.configService.get<string>('BOT_TOKEN') ??
-      this.configService.get<string>('TELEGRAM_BOT_TOKEN');
+    const token = this.resolveWithAlias('BOT_TOKEN', 'TELEGRAM_BOT_TOKEN');
     if (!token) {
       this.logger.error(
-        'BOT_TOKEN is missing. Set it in your environment or .env file.',
+        'BOT_TOKEN is missing (legacy TELEGRAM_BOT_TOKEN is also empty). Set BOT_TOKEN in your environment or .env file.',
       );
       throw new Error('BOT_TOKEN is not set.');
     }
@@ -142,7 +137,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     if (!this.webhookUrl) {
-      this.logger.error('WEBHOOK_URL/TELEGRAM_WEBHOOK_URL is missing; cannot start webhook bot');
+      this.logger.error(
+        'WEBHOOK_URL is missing (legacy TELEGRAM_WEBHOOK_URL not provided); cannot start webhook bot',
+      );
       return;
     }
 
@@ -189,6 +186,21 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         );
       }
     });
+  }
+
+  private resolveWithAlias(primaryKey: string, aliasKey: string): string | null {
+    const primary = this.configService.get<string>(primaryKey) ?? null;
+    const alias = this.configService.get<string>(aliasKey) ?? null;
+
+    if (primary && alias && primary !== alias) {
+      this.logger.warn(
+        `${primaryKey} and ${aliasKey} are both set; using ${primaryKey}. Remove the duplicate to avoid confusion.`,
+      );
+    } else if (!primary && alias) {
+      this.logger.log(`${primaryKey} not set; falling back to legacy ${aliasKey}.`);
+    }
+
+    return primary ?? alias;
   }
 
   private async getVideoUrl(option: VideoOption): Promise<string | null> {

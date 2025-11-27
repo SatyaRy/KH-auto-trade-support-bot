@@ -1,0 +1,9 @@
+.git
+node_modules
+dist
+.env
+.env.example
+npm-debug.log
+yarn.lock
+*.log
+.DS_Store

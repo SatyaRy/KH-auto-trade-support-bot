@@ -13,12 +13,13 @@ Create `.env` (or edit `.env.example`) with:
 ```
 BOT_TOKEN=your_botfather_token_here
 WEBHOOK_URL=https://your-vercel-deployment.vercel.app/telegram/webhook
-TELEGRAM_BOT_TOKEN=your_botfather_token_here                 # legacy key, optional fallback
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your_supabase_anon_key
 SUPABASE_BUCKET=videos
-TELEGRAM_WEBHOOK_URL=https://your-vercel-deployment.vercel.app/telegram/webhook   # optional: alias for WEBHOOK_URL
 TELEGRAM_WEBHOOK_SECRET=super_secret_token                       # optional: validates Telegram webhook header
+# Optional legacy aliases if you already use them
+# TELEGRAM_BOT_TOKEN=your_botfather_token_here
+# TELEGRAM_WEBHOOK_URL=https://your-vercel-deployment.vercel.app/telegram/webhook
 ```
 3) Run the bot (HTTP server + Telegram worker)
 ```
@@ -28,10 +29,22 @@ pnpm run build && node dist/main.js
 ```
 The HTTP server exposes simple endpoints (e.g., `/telegram/options`, `/telegram/health`) while the Telegram worker configures a Telegram webhook via `OnModuleInit`.
 
+## Running with Docker
+
+- Build the image: `docker build -t telegram-support-bot .`
+- Run it (mount your env): `docker run --rm -p 3000:3000 --env-file .env telegram-support-bot`
+- Ensure `.env` inside the container includes `BOT_TOKEN`, `WEBHOOK_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_BUCKET`, and optional `TELEGRAM_WEBHOOK_SECRET`.
+
+## Running with Docker Compose
+
+- Start: `docker compose up --build -d`
+- Stop: `docker compose down`
+- Uses `docker-compose.yml` with `env_file: .env` and exposes port `3000` by default; override with `PORT` in `.env` if needed.
+
 ## Deploying with webhooks (Vercel-friendly)
 
 - The bot always uses webhooks (no long polling). Telegram should call `POST /telegram/webhook` on your deployed Nest server.
-- Set `WEBHOOK_URL` (or `TELEGRAM_WEBHOOK_URL`) to the full path, e.g., `https://your-app.vercel.app/telegram/webhook`.
+- Set `WEBHOOK_URL` to the full path, e.g., `https://your-app.vercel.app/telegram/webhook`. (`TELEGRAM_WEBHOOK_URL` still works as a legacy alias.)
 - Set `TELEGRAM_WEBHOOK_SECRET` and use the same value when Telegram sends requests; the bot rejects webhook calls with the wrong secret header.
 
 ## Customizing support videos
