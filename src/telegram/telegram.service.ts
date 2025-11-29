@@ -3,6 +3,14 @@ import { ConfigService } from '@nestjs/config';
 import { Context, Markup, Telegraf } from 'telegraf';
 import { Update } from 'telegraf/types';
 
+import { createWriteStream, promises as fs } from 'fs';
+import { tmpdir } from 'os';
+import * as path from 'path';
+import { pipeline } from 'stream/promises';
+import { spawn } from 'child_process';
+import * as https from 'https';
+import * as http from 'http';
+
 import { SupabaseService } from '../supabase/supabase.service';
 
 type VideoOptionKey =
@@ -310,7 +318,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Sends video using Telegram's native compression to optimize delivery.
+   * Sends video, re-encoding MP4 with Telegram-safe settings to keep aspect ratio and quality.
    */
   private async sendVideoCompressed(
     ctx: Context,
@@ -318,6 +326,35 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     videoUrl: string,
   ): Promise<void> {
     await ctx.sendChatAction('upload_video');
+
+    if (this.isMp4(option.storagePath)) {
+      let tempOutput: string | null = null;
+      try {
+        const encoded = await this.reencodeForTelegram(videoUrl, option.storagePath);
+        tempOutput = encoded.path;
+
+        await ctx.replyWithVideo(
+          { source: encoded.path },
+          {
+            caption: option.caption,
+            supports_streaming: true,
+            width: encoded.width ?? undefined,
+            height: encoded.height ?? undefined,
+          },
+        );
+        return;
+      } catch (error) {
+        this.logger.warn(
+          `MP4 re-encode send failed for ${option.storagePath}, falling back to direct send. Error: ${String(
+            error,
+          )}`,
+        );
+      } finally {
+        if (tempOutput) {
+          await fs.unlink(tempOutput).catch(() => undefined);
+        }
+      }
+    }
 
     await ctx.replyWithVideo(
       { url: videoUrl },
@@ -328,6 +365,138 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         height: option.height ?? this.defaultVideoHeight ?? undefined,
       },
     );
+  }
+
+  private isMp4(path: string): boolean {
+    return path.toLowerCase().trim().endsWith('.mp4');
+  }
+
+  private deriveFilename(storagePath: string): string | null {
+    const segments = storagePath.split('/');
+    const candidate = segments.pop();
+    return candidate && candidate.trim().length > 0 ? candidate : null;
+  }
+
+  private async reencodeForTelegram(
+    videoUrl: string,
+    storagePath: string,
+  ): Promise<{ path: string; width: number | null; height: number | null }> {
+    const inputPath = await this.downloadToTempFile(videoUrl, storagePath);
+    const outputPath = path.join(tmpdir(), `telegram-encoded-${Date.now()}-${Math.random()}.mp4`);
+
+    try {
+      await this.runFfmpeg([
+        '-y',
+        '-i',
+        inputPath,
+        '-c:v',
+        'libx264',
+        '-profile:v',
+        'baseline',
+        '-level',
+        '3.1',
+        '-pix_fmt',
+        'yuv420p',
+        '-crf',
+        '18',
+        '-c:a',
+        'copy',
+        outputPath,
+      ]);
+
+      const dims = await this.probeVideoDimensions(outputPath);
+      return { path: outputPath, width: dims?.width ?? null, height: dims?.height ?? null };
+    } finally {
+      await fs.unlink(inputPath).catch(() => undefined);
+    }
+  }
+
+  private async downloadToTempFile(url: string, storagePath: string): Promise<string> {
+    const ext = path.extname(storagePath) || '.mp4';
+    const tempPath = path.join(tmpdir(), `telegram-download-${Date.now()}-${Math.random()}${ext}`);
+    const requester = url.startsWith('https') ? https : http;
+
+    await new Promise<void>((resolve, reject) => {
+      const request = requester.get(url, (response) => {
+        if (response.statusCode && response.statusCode >= 400) {
+          reject(new Error(`Download failed with status ${response.statusCode}`));
+          response.resume();
+          return;
+        }
+
+        const fileStream = createWriteStream(tempPath);
+        pipeline(response, fileStream).then(resolve).catch(reject);
+      });
+
+      request.on('error', reject);
+    });
+
+    return tempPath;
+  }
+
+  private async runFfmpeg(args: string[]): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      let stderr = '';
+
+      proc.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+      });
+
+      proc.on('error', (error) => reject(error));
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
+        }
+      });
+    });
+  }
+
+  private async probeVideoDimensions(
+    filePath: string,
+  ): Promise<{ width: number; height: number } | null> {
+    return new Promise((resolve) => {
+      const proc = spawn('ffprobe', [
+        '-v',
+        'error',
+        '-select_streams',
+        'v:0',
+        '-show_entries',
+        'stream=width,height',
+        '-of',
+        'json',
+        filePath,
+      ]);
+
+      let stdout = '';
+      proc.stdout.on('data', (chunk) => {
+        stdout += chunk.toString();
+      });
+
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          resolve(null);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout);
+          const stream = parsed?.streams?.[0];
+          const width = Number(stream?.width);
+          const height = Number(stream?.height);
+          if (Number.isFinite(width) && Number.isFinite(height)) {
+            resolve({ width, height });
+            return;
+          }
+        } catch {
+          // ignore parse errors
+        }
+        resolve(null);
+      });
+
+      proc.on('error', () => resolve(null));
+    });
   }
 
   private parsePositiveInt(value: string | null | undefined): number | null {
