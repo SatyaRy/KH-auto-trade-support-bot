@@ -41,6 +41,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly useLongPolling: boolean;
   private readonly defaultVideoWidth: number | null;
   private readonly defaultVideoHeight: number | null;
+  private readonly handlerTimeoutMs: number;
 
   constructor(
     private readonly configService: ConfigService,
@@ -116,6 +117,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     this.webhookSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET') ?? null;
     this.defaultVideoWidth = this.parsePositiveInt(this.configService.get<string>('TELEGRAM_VIDEO_WIDTH'));
     this.defaultVideoHeight = this.parsePositiveInt(this.configService.get<string>('TELEGRAM_VIDEO_HEIGHT'));
+    this.handlerTimeoutMs =
+      this.parsePositiveInt(this.configService.get<string>('TELEGRAM_HANDLER_TIMEOUT_MS')) ??
+      Infinity;
   }
 
   async onModuleInit(): Promise<void> {
@@ -131,7 +135,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       throw new Error('BOT_TOKEN is not set.');
     }
 
-    this.bot = new Telegraf(token, { handlerTimeout: 60_000 });
+    this.bot = new Telegraf(token, { handlerTimeout: this.handlerTimeoutMs });
+    this.bot.catch((error, ctx) => {
+      const updateId = ctx?.update?.update_id;
+      this.logger.error(`Telegram bot error${updateId ? ` on update ${updateId}` : ''}: ${String(error)}`);
+    });
 
     this.registerHandlers();
 
@@ -212,27 +220,24 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      await ctx.answerCbQuery('Success ✅');
-      await ctx.replyWithHTML(`Success: <b>${option.label}</b>\n\n${option.caption}`);
-      const statusMessage = await ctx.reply('Video sending...');
+      await ctx.answerCbQuery('Sending video…');
+      const statusMessage = await ctx.reply('📤 Video is sending...');
 
       const videoUrl = await this.getVideoUrl(option);
       if (!videoUrl) {
         await ctx.reply(
           'Video will be delivered soon. (Supabase storage not configured or file not found.)',
         );
-        await this.safeEditMessage(statusMessage.chat.id, statusMessage.message_id, 'Video will be sent once available.');
+        await this.safeEditMessage(statusMessage.chat.id, statusMessage.message_id, '⚠️ Video will be sent once available.');
         return;
       }
 
       try {
-        const deliveredAsDocument = await this.sendVideoWithBestQuality(ctx, option, videoUrl);
+        await this.sendVideoCompressed(ctx, option, videoUrl);
         await this.safeEditMessage(
           statusMessage.chat.id,
           statusMessage.message_id,
-          deliveredAsDocument
-            ? `Video sent (original quality): ${option.label}`
-            : `Video sent: ${option.label}`,
+          `✅ Video sent: ${option.label}`,
         );
       } catch (error) {
         this.logger.error(`Failed to send video for ${option.storagePath}: ${String(error)}`);
@@ -240,7 +245,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         await this.safeEditMessage(
           statusMessage.chat.id,
           statusMessage.message_id,
-          'Failed to send video. Please try again.',
+          '❌ Failed to send video. Please try again.',
         );
       }
     });
@@ -305,28 +310,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Sends videos as documents first to avoid Telegram's video recompression.
-   * Falls back to regular video delivery if document delivery fails.
+   * Sends video using Telegram's native compression to optimize delivery.
    */
-  private async sendVideoWithBestQuality(
+  private async sendVideoCompressed(
     ctx: Context,
     option: VideoOption,
     videoUrl: string,
-  ): Promise<boolean> {
-    try {
-      await ctx.replyWithDocument(
-        {
-          url: videoUrl,
-          filename: this.deriveFilename(option.storagePath) ?? undefined,
-        },
-        { caption: option.caption },
-      );
-      return true;
-    } catch (error) {
-      this.logger.warn(
-        `High-quality (document) send failed for ${option.storagePath}. Falling back to video. Error: ${String(error)}`,
-      );
-    }
+  ): Promise<void> {
+    await ctx.sendChatAction('upload_video');
 
     await ctx.replyWithVideo(
       { url: videoUrl },
@@ -337,13 +328,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         height: option.height ?? this.defaultVideoHeight ?? undefined,
       },
     );
-    return false;
-  }
-
-  private deriveFilename(storagePath: string): string | null {
-    const segments = storagePath.split('/');
-    const candidate = segments.pop();
-    return candidate && candidate.trim().length > 0 ? candidate : null;
   }
 
   private parsePositiveInt(value: string | null | undefined): number | null {
