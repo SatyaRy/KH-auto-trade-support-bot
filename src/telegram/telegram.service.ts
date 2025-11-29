@@ -20,6 +20,8 @@ type VideoOption = {
   label: string;
   caption: string;
   storagePath: string;
+  width?: number;
+  height?: number;
 };
 
 @Injectable()
@@ -37,6 +39,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly webhookUrl: string | null;
   private readonly webhookSecret: string | null;
   private readonly useLongPolling: boolean;
+  private readonly defaultVideoWidth: number | null;
+  private readonly defaultVideoHeight: number | null;
 
   constructor(
     private readonly configService: ConfigService,
@@ -110,6 +114,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     this.useLongPolling = pollingPreference === 'true' || !this.webhookUrl;
     this.webhookSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET') ?? null;
+    this.defaultVideoWidth = this.parsePositiveInt(this.configService.get<string>('TELEGRAM_VIDEO_WIDTH'));
+    this.defaultVideoHeight = this.parsePositiveInt(this.configService.get<string>('TELEGRAM_VIDEO_HEIGHT'));
   }
 
   async onModuleInit(): Promise<void> {
@@ -324,7 +330,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
     await ctx.replyWithVideo(
       { url: videoUrl },
-      { caption: option.caption, supports_streaming: true },
+      {
+        caption: option.caption,
+        supports_streaming: true,
+        width: option.width ?? this.defaultVideoWidth ?? undefined,
+        height: option.height ?? this.defaultVideoHeight ?? undefined,
+      },
     );
     return false;
   }
@@ -333,6 +344,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const segments = storagePath.split('/');
     const candidate = segments.pop();
     return candidate && candidate.trim().length > 0 ? candidate : null;
+  }
+
+  private parsePositiveInt(value: string | null | undefined): number | null {
+    if (!value) {
+      return null;
+    }
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   }
 
   /**
