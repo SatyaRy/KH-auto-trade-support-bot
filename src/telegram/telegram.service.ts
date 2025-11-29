@@ -208,20 +208,32 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
       await ctx.answerCbQuery('Success ✅');
       await ctx.replyWithHTML(`Success: <b>${option.label}</b>\n\n${option.caption}`);
+      const statusMessage = await ctx.reply('Video sending...');
 
       const videoUrl = await this.getVideoUrl(option);
       if (!videoUrl) {
         await ctx.reply(
           'Video will be delivered soon. (Supabase storage not configured or file not found.)',
         );
+        await this.safeEditMessage(statusMessage.chat.id, statusMessage.message_id, 'Video will be sent once available.');
         return;
       }
 
       try {
         await ctx.replyWithVideo({ url: videoUrl }, { caption: option.caption });
+        await this.safeEditMessage(
+          statusMessage.chat.id,
+          statusMessage.message_id,
+          `Video sent: ${option.label}`,
+        );
       } catch (error) {
         this.logger.error(`Failed to send video for ${option.storagePath}: ${String(error)}`);
         await ctx.reply('Sorry, failed to send the video. Please try again in a moment.');
+        await this.safeEditMessage(
+          statusMessage.chat.id,
+          statusMessage.message_id,
+          'Failed to send video. Please try again.',
+        );
       }
     });
   }
@@ -282,6 +294,22 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   private isVideoOptionKey(value: string): value is VideoOptionKey {
     return value in this.videoOptions;
+  }
+
+  /**
+   * Attempts to edit a message while ignoring common edit errors (e.g., message not found).
+   */
+  private async safeEditMessage(chatId: number, messageId: number, text: string): Promise<void> {
+    const bot = this.bot;
+    if (!bot) {
+      return;
+    }
+
+    try {
+      await bot.telegram.editMessageText(chatId, messageId, undefined, text);
+    } catch (error) {
+      this.logger.debug(`Unable to edit message ${messageId}: ${String(error)}`);
+    }
   }
 
   getOptions(): Array<VideoOption & { key: VideoOptionKey }> {
