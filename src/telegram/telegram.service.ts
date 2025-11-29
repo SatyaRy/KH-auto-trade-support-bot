@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Markup, Telegraf } from 'telegraf';
+import { Context, Markup, Telegraf } from 'telegraf';
 import { Update } from 'telegraf/types';
 
 import { SupabaseService } from '../supabase/supabase.service';
@@ -220,11 +220,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       }
 
       try {
-        await ctx.replyWithVideo({ url: videoUrl }, { caption: option.caption });
+        const deliveredAsDocument = await this.sendVideoWithBestQuality(ctx, option, videoUrl);
         await this.safeEditMessage(
           statusMessage.chat.id,
           statusMessage.message_id,
-          `Video sent: ${option.label}`,
+          deliveredAsDocument
+            ? `Video sent (original quality): ${option.label}`
+            : `Video sent: ${option.label}`,
         );
       } catch (error) {
         this.logger.error(`Failed to send video for ${option.storagePath}: ${String(error)}`);
@@ -294,6 +296,43 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   private isVideoOptionKey(value: string): value is VideoOptionKey {
     return value in this.videoOptions;
+  }
+
+  /**
+   * Sends videos as documents first to avoid Telegram's video recompression.
+   * Falls back to regular video delivery if document delivery fails.
+   */
+  private async sendVideoWithBestQuality(
+    ctx: Context,
+    option: VideoOption,
+    videoUrl: string,
+  ): Promise<boolean> {
+    try {
+      await ctx.replyWithDocument(
+        {
+          url: videoUrl,
+          filename: this.deriveFilename(option.storagePath) ?? undefined,
+        },
+        { caption: option.caption },
+      );
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `High-quality (document) send failed for ${option.storagePath}. Falling back to video. Error: ${String(error)}`,
+      );
+    }
+
+    await ctx.replyWithVideo(
+      { url: videoUrl },
+      { caption: option.caption, supports_streaming: true },
+    );
+    return false;
+  }
+
+  private deriveFilename(storagePath: string): string | null {
+    const segments = storagePath.split('/');
+    const candidate = segments.pop();
+    return candidate && candidate.trim().length > 0 ? candidate : null;
   }
 
   /**
