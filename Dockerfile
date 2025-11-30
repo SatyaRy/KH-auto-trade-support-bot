@@ -1,4 +1,4 @@
-FROM node:20-alpine AS base
+FROM node:alpine AS base
 WORKDIR /app
 ENV PNPM_HOME="/root/.local/share/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -20,7 +20,8 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile --prod
 
 # Final runtime image
-FROM node:20-alpine AS runner
+FROM node:alpine AS runner
+RUN apk add --no-cache ffmpeg
 WORKDIR /app
 ENV NODE_ENV=production
 
