@@ -46,10 +46,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly supabaseBucket: string | null;
   private readonly webhookUrl: string | null;
   private readonly webhookSecret: string | null;
-  private readonly useLongPolling: boolean;
+  private useLongPolling: boolean;
+  private readonly preferDirectSend: boolean;
   private readonly defaultVideoWidth: number | null;
   private readonly defaultVideoHeight: number | null;
   private readonly handlerTimeoutMs: number;
+  private ffmpegAvailable: boolean | null = null;
+  private readonly activeSends = new Set<number>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -128,6 +131,10 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     this.handlerTimeoutMs =
       this.parsePositiveInt(this.configService.get<string>('TELEGRAM_HANDLER_TIMEOUT_MS')) ??
       Infinity;
+    this.preferDirectSend =
+      (this.configService.get<string>('TELEGRAM_PREFER_DIRECT_SEND') ?? 'false')
+        .toLowerCase()
+        .trim() === 'true';
   }
 
   async onModuleInit(): Promise<void> {
@@ -149,6 +156,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`Telegram bot error${updateId ? ` on update ${updateId}` : ''}: ${String(error)}`);
     });
 
+    await this.checkFfmpegAvailable();
     this.registerHandlers();
 
     if (this.useLongPolling) {
@@ -156,7 +164,14 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await this.configureWebhook();
+    const webhookConfigured = await this.configureWebhook();
+    if (!webhookConfigured) {
+      this.logger.warn('Falling back to long polling after webhook configuration failed.');
+      this.useLongPolling = true;
+      await this.startLongPolling();
+      return;
+    }
+
     this.logger.log('Telegram bot is running with webhooks');
   }
 
@@ -168,31 +183,41 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      await this.bot.telegram.deleteWebhook({ drop_pending_updates: true });
-      this.logger.log('Removed Telegram bot webhook');
+      const removed = await this.deleteWebhookSafe('shutdown');
+      if (removed) {
+        this.logger.log('Removed Telegram bot webhook');
+      }
     }
   }
 
-  private async configureWebhook(): Promise<void> {
+  private async configureWebhook(): Promise<boolean> {
     const bot = this.bot;
     if (!bot) {
-      return;
+      return false;
     }
 
     if (!this.webhookUrl) {
       this.logger.error(
         'WEBHOOK_URL is missing (legacy TELEGRAM_WEBHOOK_URL not provided); cannot start webhook bot',
       );
-      return;
+      return false;
     }
 
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-    await bot.telegram.setWebhook(this.webhookUrl, {
-      secret_token: this.webhookSecret ?? undefined,
-      allowed_updates: ['message', 'callback_query'],
-    });
+    await this.deleteWebhookSafe('before setting webhook');
 
-    this.logger.log(`Webhook configured at ${this.webhookUrl}`);
+    try {
+      await bot.telegram.setWebhook(this.webhookUrl, {
+        secret_token: this.webhookSecret ?? undefined,
+        allowed_updates: ['message', 'callback_query'],
+      });
+      this.logger.log(`Webhook configured at ${this.webhookUrl}`);
+      return true;
+    } catch (error) {
+      this.logger.error(
+        `Failed to set Telegram webhook at ${this.webhookUrl}: ${String(error)}`,
+      );
+      return false;
+    }
   }
 
   private async startLongPolling(): Promise<void> {
@@ -201,9 +226,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    await this.deleteWebhookSafe('before starting long polling');
     await bot.launch({ dropPendingUpdates: true });
-    this.logger.log('Telegram bot is running with long polling (no webhook configured)');
+    this.logger.log(
+      'Telegram bot is running with long polling (no webhook configured)',
+    );
   }
 
   private registerHandlers(): void {
@@ -222,39 +249,63 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
           ? (callbackQuery.data as string | undefined)
           : undefined;
 
-      const option = data && this.isVideoOptionKey(data) ? this.videoOptions[data] : null;
-      if (!option) {
-        await ctx.answerCbQuery('Unknown option');
+      const chatId = ctx.chat?.id;
+      if (typeof chatId === 'number' && this.activeSends.has(chatId)) {
+        await this.safeAnswerCbQuery(ctx, '⏳ Please wait until the current video finishes sending.');
         return;
       }
 
-      await ctx.answerCbQuery('Sending video…');
-      const statusMessage = await ctx.reply('📤 Video is sending...');
-
-      const videoUrl = await this.getVideoUrl(option);
-      if (!videoUrl) {
-        await ctx.reply(
-          'Video will be delivered soon. (Supabase storage not configured or file not found.)',
-        );
-        await this.safeEditMessage(statusMessage.chat.id, statusMessage.message_id, '⚠️ Video will be sent once available.');
+      const option = data && this.isVideoOptionKey(data) ? this.videoOptions[data] : null;
+      if (!option) {
+        await this.safeAnswerCbQuery(ctx, 'Unknown option');
         return;
       }
 
       try {
-        await this.sendVideoCompressed(ctx, option, videoUrl);
-        await this.safeEditMessage(
-          statusMessage.chat.id,
-          statusMessage.message_id,
-          `✅ Video sent: ${option.label}`,
-        );
+        if (typeof chatId === 'number') {
+          this.activeSends.add(chatId);
+        }
+
+        await this.safeAnswerCbQuery(ctx, 'Sending video…');
+        const statusMessage = await ctx.reply('📤 Video is sending...');
+
+        try {
+          const videoUrl = await this.getVideoUrl(option);
+          if (!videoUrl) {
+            await ctx.reply(
+              'Video will be delivered soon. (Supabase storage not configured or file not found.)',
+            );
+            await this.safeEditMessage(statusMessage.chat.id, statusMessage.message_id, '⚠️ Video will be sent once available.');
+            return;
+          }
+
+          try {
+            await this.sendVideoCompressed(ctx, option, videoUrl);
+            await this.safeEditMessage(
+              statusMessage.chat.id,
+              statusMessage.message_id,
+              `✅ Video sent: ${option.label}`,
+            );
+          } catch (error) {
+            this.logger.error(`Failed to send video for ${option.storagePath}: ${String(error)}`);
+            await ctx.reply('Sorry, failed to send the video. Please try again in a moment.');
+            await this.safeEditMessage(
+              statusMessage.chat.id,
+              statusMessage.message_id,
+              '❌ Failed to send video. Please try again.',
+            );
+          }
+        } finally {
+          if (typeof chatId === 'number') {
+            this.activeSends.delete(chatId);
+          }
+        }
       } catch (error) {
-        this.logger.error(`Failed to send video for ${option.storagePath}: ${String(error)}`);
-        await ctx.reply('Sorry, failed to send the video. Please try again in a moment.');
-        await this.safeEditMessage(
-          statusMessage.chat.id,
-          statusMessage.message_id,
-          '❌ Failed to send video. Please try again.',
-        );
+        this.logger.warn(`Callback handling failed: ${String(error)}`);
+        await this.safeAnswerCbQuery(ctx, '⚠️ Something went wrong, please try again.');
+        if (typeof chatId === 'number') {
+          this.activeSends.delete(chatId);
+        }
       }
     });
   }
@@ -327,7 +378,30 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   ): Promise<void> {
     await ctx.sendChatAction('upload_video');
 
-    if (this.isMp4(option.storagePath)) {
+    const isMp4 = this.isMp4(option.storagePath);
+    const canReencode = isMp4 && (await this.checkFfmpegAvailable());
+    const shouldDirectSendFirst = isMp4 && this.preferDirectSend;
+
+    if (shouldDirectSendFirst) {
+      try {
+        await ctx.replyWithVideo(
+          { url: videoUrl },
+          {
+            caption: option.caption,
+            supports_streaming: true,
+          },
+        );
+        return;
+      } catch (error) {
+        this.logger.warn(
+          `Direct send failed for ${option.storagePath}, falling back to re-encode if available. Error: ${String(
+            error,
+          )}`,
+        );
+      }
+    }
+
+    if (canReencode) {
       let tempOutput: string | null = null;
       try {
         const encoded = await this.reencodeForTelegram(videoUrl, option.storagePath);
@@ -361,8 +435,6 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       {
         caption: option.caption,
         supports_streaming: true,
-        width: option.width ?? this.defaultVideoWidth ?? undefined,
-        height: option.height ?? this.defaultVideoHeight ?? undefined,
       },
     );
   }
@@ -387,6 +459,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     try {
       await this.runFfmpeg([
         '-y',
+        '-noautorotate',
         '-i',
         inputPath,
         '-c:v',
@@ -397,8 +470,17 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         '3.1',
         '-pix_fmt',
         'yuv420p',
+        // Preserve aspect ratio, normalize SAR, and ignore rotation metadata by rewriting it.
+        '-vf',
+        'scale=-2:720,setsar=1,format=yuv420p',
+        '-preset',
+        'veryfast',
         '-crf',
-        '18',
+        '17',
+        '-metadata:s:v:0',
+        'rotate=0',
+        '-movflags',
+        '+faststart',
         '-c:a',
         'copy',
         outputPath,
@@ -452,6 +534,26 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         }
       });
     });
+  }
+
+  private async checkFfmpegAvailable(): Promise<boolean> {
+    if (this.ffmpegAvailable !== null) {
+      return this.ffmpegAvailable;
+    }
+
+    this.ffmpegAvailable = await new Promise<boolean>((resolve) => {
+      const probe = spawn('ffmpeg', ['-version']);
+      probe.on('error', () => resolve(false));
+      probe.on('close', (code) => resolve(code === 0));
+    });
+
+    if (!this.ffmpegAvailable) {
+      this.logger.warn(
+        'ffmpeg not found on PATH; skipping re-encode and sending videos directly. Install ffmpeg to improve Telegram playback quality.',
+      );
+    }
+
+    return this.ffmpegAvailable;
   }
 
   private async probeVideoDimensions(
@@ -532,6 +634,35 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     await this.stop();
+  }
+
+  private async safeAnswerCbQuery(ctx: Context, text: string): Promise<void> {
+    try {
+      await ctx.answerCbQuery(text);
+    } catch (error) {
+      this.logger.debug(`Unable to answer callback query: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Deletes the Telegram webhook and logs (but does not throw) network errors so startup/shutdown
+   * can continue even when Telegram API is temporarily unreachable.
+   */
+  private async deleteWebhookSafe(context: string): Promise<boolean> {
+    const bot = this.bot;
+    if (!bot) {
+      return false;
+    }
+
+    try {
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `Failed to delete Telegram webhook (${context}): ${String(error)}`,
+      );
+      return false;
+    }
   }
 
   async handleWebhookUpdate(
